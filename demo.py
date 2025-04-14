@@ -166,6 +166,7 @@ def inference(view_points,
             print('No 2d grasp found')
             return
 
+	# Changed to Uint8 Type
         # show heatmap
         if vis_heatmap:
             rgb_t = x[0, 1:].cpu().numpy().squeeze().transpose(2, 1, 0)
@@ -274,6 +275,7 @@ if __name__ == '__main__':
     localnet = localnet.cuda()
 
     # Load checkpoint
+    print(args.checkpoint_path)
     check_point = torch.load(args.checkpoint_path)
     anchornet.load_state_dict(check_point['anchor'])
     localnet.load_state_dict(check_point['local'])
@@ -291,7 +293,7 @@ if __name__ == '__main__':
     localnet.eval()
 
     # read image and conver to tensor
-    ori_depth = np.array(Image.open(args.depth_path))
+    ori_depth = np.array(Image.open(args.depth_path),dtype=np.float32)
     ori_rgb = np.array(Image.open(args.rgb_path)) / 255.0
     ori_depth = np.clip(ori_depth, 0, 1000)
     ori_rgb = torch.from_numpy(ori_rgb).permute(2, 1, 0)[None]

@@ -57,6 +57,10 @@ RUN apt-get update
 # 'python' program command execute Python 3
 RUN apt install  python-is-python3
 
+# Libglib2.0 install
+RUN apt-get update && apt-get install -y libglib2.0-0
+
+
 # Definiere Standardkommando, wenn der Container startet
 #CMD ["bash", "demo.sh"]
 CMD ["bash"]
