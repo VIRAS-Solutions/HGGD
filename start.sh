@@ -15,6 +15,8 @@ docker run -it \
     --volume="/tmp/.X11-unix:/tmp/.X11-unix:rw" \
     --network="host" \
     --volume="$(pwd):/workspace/models/HGGD" \
+    --volume="$(pwd)/../../ros2_ws:/ros2/ros2_ws" \
+    --volume="$(pwd)/../../viras-solution-ros-interfaces:/workspace/viras-solution-ros-interfaces" \
     --runtime=nvidia \
     --gpus=all \
     $IMAGE_NAME:latest /bin/bash
