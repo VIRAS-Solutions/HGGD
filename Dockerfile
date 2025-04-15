@@ -3,11 +3,6 @@ FROM nvidia/cuda:11.3.1-cudnn8-runtime-ubuntu20.04
 ENV DEBIAN_FRONTEND=noninteractive
 ENV LANG=C.UTF-8
 
-# ROS2 Setup
-RUN apt update && apt install -y curl gnupg2 lsb-release
-RUN curl -sSL https://raw.githubusercontent.com/ros/rosdistro/master/ros.asc | apt-key add -
-RUN echo "deb http://packages.ros.org/ros2/ubuntu $(lsb_release -cs) main" > /etc/apt/sources.list.d/ros2-latest.list
-
 RUN apt update && apt install -y \
     ros-galactic-desktop \
     python3-colcon-common-extensions \
@@ -32,12 +27,15 @@ RUN apt update && apt install -y \
     && rm -rf /var/lib/apt/lists/*
 
 
-# Python 3.8 als Standard setzen
+# X11 Dependencies
+RUN apt-get update && apt-get install -y x11-apps xauth
+
+# Python 3.8 as standard
 RUN update-alternatives --install /usr/bin/python3 python3 /usr/bin/python3.8 1
 RUN python3 -m pip install --upgrade pip
 
 
-# Installiere requirements.txt aus dem Modellverzeichnis
+# Installrequirements.txt
 WORKDIR /workspace/models/HGGD
 # COPY src/models/HGGD/requirements.txt .
 COPY requirements.txt .
@@ -54,7 +52,17 @@ RUN pip install fvcore
 RUN pip install --no-index --no-cache-dir pytorch3d \
     -f https://dl.fbaipublicfiles.com/pytorch3d/packaging/wheels/py38_cu113_pyt1110/download.html
 
-# ROS2 Environment konfigurieren
+
+# ROS2 Installation
+# ROS2 SEtup
+RUN apt update && apt install -y curl gnupg2 lsb-release
+RUN curl -sSL https://raw.githubusercontent.com/ros/rosdistro/master/ros.asc | apt-key add -
+RUN echo "deb http://packages.ros.org/ros2/ubuntu $(lsb_release -cs) main" > /etc/apt/sources.list.d/ros2-latest.list
+
+
+
+
+# ROS2 Environment configuration
 RUN echo "source /opt/ros/galactic/setup.bash" >> /root/.bashrc
 
 # Colcon-Workspace vorbereiten
