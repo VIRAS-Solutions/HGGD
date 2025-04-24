@@ -7,7 +7,17 @@ camera = 'realsense'
 logging.warning(f'Using {camera} camera now!')
 
 
+def set_current_camera_intrinsics(intrinsics):
+    global current_camera_intrinsics
+    current_camera_intrinsics = intrinsics
+
 def get_camera_intrinsic(camera=camera):
+    # Set dynammically camera instrinsics from ImageRGBD ROS Topic
+    if current_camera_intrinsics is not None:
+        return current_camera_intrinsics
+    
+    logging.warning("Using fallback camera intrinsics - no dynamic values available!")
+    #Fallback to hardcoded instrinsics
     if camera == 'kinect':
         intrinsics = np.array([[631.55, 0, 638.43], [0, 631.21, 366.50],
                                [0, 0, 1]])
