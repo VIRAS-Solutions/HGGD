@@ -34,6 +34,9 @@ def points_2_pixel_depth(points):
     # y = point[0] / point[2] * fx + cx
     # x = point[1] / point[2] * fy + cy
     # cx = 640, cy = 360
+
+    # MUSS NOCHMAL GECHECKT WERDEN!!!
+    
     coords_x = points[:, 0] / points[:, 2] * fx + cx  # 1280
     coords_y = points[:, 1] / points[:, 2] * fy + cy  # 720
     coords = np.stack([

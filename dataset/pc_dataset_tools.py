@@ -140,9 +140,10 @@ def center2dtopc(rect_ggs: List,
     center_batch_pc = []
 
     #Old
-    #scale_x, scale_y = 1280 / output_size[0], 720 / output_size[1]
+    scale_x, scale_y = 1280 / output_size[0], 720 / output_size[1]
     
-    scale_x, scale_y = 640 / output_size[0], 480 / output_size[1]
+    #New
+    #scale_x, scale_y = 640 / output_size[0], 480 / output_size[1]
     
     for i in range(batch_size):
         center_2d = rect_ggs[i].centers.copy()
@@ -183,11 +184,12 @@ def center2dtopc(rect_ggs: List,
             neighbor = 4
 
             #Old
-            #x_range = slice(max(0, x - neighbor), min(1279, x + neighbor))
-            #y_range = slice(max(0, y - neighbor), min(719, y + neighbor))
+            x_range = slice(max(0, x - neighbor), min(1279, x + neighbor))
+            y_range = slice(max(0, y - neighbor), min(719, y + neighbor))
 
-            x_range = slice(max(0, x - neighbor), min(639, x + neighbor))
-            y_range = slice(max(0, y - neighbor), min(479, y + neighbor))
+            #New
+            # x_range = slice(max(0, x - neighbor), min(639, x + neighbor))
+            # y_range = slice(max(0, y - neighbor), min(479, y + neighbor))
 
             neighbor_depths = depths[i, x_range, y_range]
             depth_mask = (neighbor_depths > 0)
