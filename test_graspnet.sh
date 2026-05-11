@@ -1,4 +1,5 @@
 CUDA_VISIBLE_DEVICES=0 python test_graspnet.py \
+<<<<<<< Updated upstream
 --center-num 48 \
 --anchor-num 7 \
 --anchor-k 6 \
@@ -21,3 +22,27 @@ CUDA_VISIBLE_DEVICES=0 python test_graspnet.py \
 --scene-path '/ssd/graspnet' \
 --dump-dir 'pred_grasps' \
 --description 'realsense_seen'
+=======
+    --center-num 48 \
+    --anchor-num 7 \
+    --anchor-k 6 \
+    --anchor-w 50 \
+    --anchor-z 20 \
+    --grid-size 8 \
+    --all-points-num 25600 \
+    --group-num 512 \
+    --local-k 10 \
+    --ratio 8 \
+    --input-h 360 \
+    --input-w 640 \
+    --local-thres 0.01 \
+    --heatmap-thres 0.01 \
+    --num-workers 4 \
+    --dataset-path '/data/hggd_dataset/grasp_label' \
+    --scene-path '/data/hggd_dataset' \
+    --checkpoint-path '/home/hggd/logs/260505_081627_proberoehrchen_v1/epoch_11_iou_0.682_cover_0.002' \
+    --frames-per-scene 50 \
+    --dump-dir '/data/hggd_dataset/pred_grasps_proberoehrchen' \
+    --description 'proberoehrchen_test' \
+    --vis-frame-ids "0,50,176,185,395,464" \
+>>>>>>> Stashed changes
