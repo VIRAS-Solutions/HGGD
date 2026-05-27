@@ -1,9 +1,40 @@
+"""
+test_graspnet.py
+================
+
+Patched version for VIRAS Probenröhrchen-Datensatz:
+  - Liest Test-Szenen aus splits.json (analog zu train_graspnet.py)
+  - Nutzt --frames-per-scene Argument
+  - cupoch-Import entfernt (Blackwell-Inkompatibilität)
+  - GraspNetEval-basierte evaluate() ersetzt durch eigene Funktion,
+    die NPZ-Labels mit Predictions vergleicht (analog zu validate()
+    in train_graspnet.py).
+
+Aufruf:
+    CUDA_VISIBLE_DEVICES=0 python test_graspnet.py \\
+        --center-num 48 --anchor-num 7 --anchor-k 6 \\
+        --anchor-w 50 --anchor-z 20 --grid-size 8 \\
+        --all-points-num 25600 --group-num 512 \\
+        --local-k 10 --ratio 8 \\
+        --input-h 360 --input-w 640 \\
+        --num-workers 4 \\
+        --dataset-path '/data/hggd_dataset/grasp_label' \\
+        --scene-path '/data/hggd_dataset' \\
+        --checkpoint-path '/home/hggd/logs/proberoehrchen_v1/epoch_11.pt' \\
+        --frames-per-scene 50 \\
+        --dump-dir 'pred_grasps_proberoehrchen' \\
+        --description 'proberoehrchen_test'
+"""
+
 import argparse
+import datetime
+import json
+import logging
 import os
 import random
 from time import time
 
-import cupoch
+# import cupoch  # disabled: not used, Blackwell-incompatible
 import numpy as np
 import open3d as o3d
 import torch
@@ -12,35 +43,46 @@ from torch.utils.data import DataLoader
 
 from customgraspnetAPI import Grasp as GraspNetGrasp
 from customgraspnetAPI import GraspGroup as GraspNetGraspGroup
-from customgraspnetAPI import GraspNetEval
 from dataset.config import camera
-from dataset.evaluation import (anchor_output_process, collision_detect,
-                                detect_2d_grasp, detect_6d_grasp_multi)
+from dataset.evaluation import (anchor_output_process, calculate_6d_match,
+                                calculate_coverage, calculate_iou_match,
+                                collision_detect, detect_2d_grasp,
+                                detect_6d_grasp_multi)
 from dataset.grasp import GraspGroup as HGGDGraspGroup
 from dataset.grasp import RectGraspGroup
 from dataset.graspnet_dataset import GraspnetPointDataset
-from dataset.pc_dataset_tools import data_process, feature_fusion
+from dataset.pc_dataset_tools import (data_process, feature_fusion,
+                                      get_ori_grasp_label)
 from models.anchornet import AnchorGraspNet
 from models.localgraspnet import PointMultiGraspNet
-from train_utils import *
 
+
+# =============================================================================
+# Argumente
+# =============================================================================
 parser = argparse.ArgumentParser()
-parser.add_argument('--checkpoint-path', default=None)
+parser.add_argument('--checkpoint-path', required=True,
+                    help='Pfad zum trainierten Checkpoint (.pt)')
 
-# dataset
-parser.add_argument('--dataset-path')
-parser.add_argument('--scene-path')
-parser.add_argument('--scene-l', type=int)
-parser.add_argument('--scene-r', type=int)
+# Dataset
+parser.add_argument('--dataset-path', required=True,
+                    help='Pfad zum grasp_label-Verzeichnis')
+parser.add_argument('--scene-path', required=True,
+                    help='Pfad zum Eltern-Verzeichnis von scenes/ (mit splits.json)')
+parser.add_argument('--scene-l', type=int, default=0,
+                    help='Fallback wenn keine splits.json: untere Scene-ID')
+parser.add_argument('--scene-r', type=int, default=100,
+                    help='Fallback wenn keine splits.json: obere Scene-ID (exclusive)')
+parser.add_argument('--frames-per-scene', type=int, default=256,
+                    help='Frames pro Szene (GraspNet: 256, VIRAS: 50)')
 parser.add_argument('--grasp-count', type=int, default=5000)
-parser.add_argument('--dump-dir',
-                    help='Dump dir to save outputs',
-                    default='./pred/test')
+parser.add_argument('--dump-dir', default='./pred/test',
+                    help='Verzeichnis für die Predictions (NPY pro Frame)')
 parser.add_argument('--num-workers', type=int, default=4)
 
-# 2d
-parser.add_argument('--input-h', type=int)
-parser.add_argument('--input-w', type=int)
+# 2D-Anchor-Net
+parser.add_argument('--input-h', type=int, required=True)
+parser.add_argument('--input-w', type=int, required=True)
 parser.add_argument('--sigma', type=int, default=10)
 parser.add_argument('--ratio', type=int, default=8)
 parser.add_argument('--anchor-k', type=int, default=6)
@@ -48,36 +90,73 @@ parser.add_argument('--anchor-w', type=float, default=50.0)
 parser.add_argument('--anchor-z', type=float, default=20.0)
 parser.add_argument('--grid-size', type=int, default=8)
 
-# pc
-parser.add_argument('--anchor-num', type=int)
-parser.add_argument('--all-points-num', type=int)
-parser.add_argument('--center-num', type=int)
-parser.add_argument('--group-num', type=int)
+# Punktwolken-Net
+parser.add_argument('--anchor-num', type=int, required=True)
+parser.add_argument('--all-points-num', type=int, required=True)
+parser.add_argument('--center-num', type=int, required=True)
+parser.add_argument('--group-num', type=int, required=True)
 parser.add_argument('--local-grasp-num', type=int, default=5000)
 
-# grasp detection
+# Grasp-Detection-Schwellen
 parser.add_argument('--heatmap-thres', type=float, default=0.01)
 parser.add_argument('--local-k', type=int, default=10)
 parser.add_argument('--local-thres', type=float, default=0.01)
 parser.add_argument('--rotation-num', type=int, default=1)
 
-# others
-parser.add_argument('--logdir',
-                    type=str,
-                    default='./logs/',
-                    help='Log directory')
-parser.add_argument('--random-seed', type=int, default=123, help='Random seed')
-parser.add_argument('--description',
-                    type=str,
-                    default='',
-                    help='Logging description')
+# Evaluation
+parser.add_argument('--skip-eval', action='store_true',
+                    help='Überspringt die Evaluation, dumpt nur Predictions')
+parser.add_argument('--vis-frame-ids', type=str, default='',
+                    help='Komma-getrennte Frame-Indizes für Open3D-Visualisierung')
+
+# Logging
+parser.add_argument('--logdir', type=str, default='./logs/')
+parser.add_argument('--random-seed', type=int, default=123)
+parser.add_argument('--description', type=str, default='')
 
 args = parser.parse_args()
 
 
-def inference():
-    sceneIds = list(range(args.scene_l, args.scene_r))
-    # Create Dataset and Dataloader
+# =============================================================================
+# Konstanten für Eval (gleich wie in train_graspnet.py)
+# =============================================================================
+dis_criterion = 0.05
+rot_criterion = 0.25
+eval_scale = [0.2, 0.4, 0.6, 0.8, 1.0]
+
+
+# =============================================================================
+# Test-Szenen aus splits.json laden
+# =============================================================================
+def load_test_scenes(scene_path):
+    """
+    Lädt die Test-Scene-IDs aus splits.json, falls vorhanden,
+    sonst Fallback auf --scene-l/--scene-r.
+    """
+    splits_file = os.path.join(scene_path, 'splits.json')
+    if os.path.exists(splits_file):
+        with open(splits_file) as f:
+            splits = json.load(f)
+        test_ids = sorted(splits['test'])
+        logging.info(f'Using splits.json test set: {len(test_ids)} scenes')
+        logging.info(f'  Scene IDs: {test_ids}')
+        return test_ids
+    else:
+        ids = list(range(args.scene_l, args.scene_r))
+        logging.warning(f'No splits.json at {splits_file}, '
+                        f'falling back to range({args.scene_l}, {args.scene_r}): '
+                        f'{len(ids)} scenes')
+        return ids
+
+
+# =============================================================================
+# Inferenz: Predictions berechnen und dumpen
+# =============================================================================
+def inference(sceneIds):
+    """
+    Läuft das Modell auf allen Test-Frames und speichert pro Frame eine
+    NPY-Datei mit den vorhergesagten Grasps (im GraspNet-Format).
+    """
     test_dataset = GraspnetPointDataset(args.all_points_num,
                                         args.dataset_path,
                                         args.scene_path,
@@ -91,7 +170,8 @@ def inference():
                                         output_size=(args.input_w,
                                                      args.input_h),
                                         random_rotate=False,
-                                        random_zoom=False)
+                                        random_zoom=False,
+                                        frames_per_scene=args.frames_per_scene)
 
     SCENE_LIST = test_dataset.scene_list()
     test_data = DataLoader(test_dataset,
@@ -101,64 +181,65 @@ def inference():
     test_data.dataset.unaug()
     test_data.dataset.eval()
 
-    # Init the model
+    # Modelle initialisieren
     input_channels = 4
     anchornet = AnchorGraspNet(in_dim=input_channels,
                                ratio=args.ratio,
-                               anchor_k=args.anchor_k)
-    localnet = PointMultiGraspNet(info_size=3, k_cls=args.anchor_num**2)
+                               anchor_k=args.anchor_k).cuda()
+    localnet = PointMultiGraspNet(info_size=3, k_cls=args.anchor_num**2).cuda()
 
-    # multi gpu
-    anchornet = anchornet.cuda()
-    localnet = localnet.cuda()
-
-    # Load checkpoint
-    check_point = torch.load(args.checkpoint_path)
+    # Checkpoint laden
+    check_point = torch.load(args.checkpoint_path, weights_only=False)
     anchornet.load_state_dict(check_point['anchor'])
     localnet.load_state_dict(check_point['local'])
-    # load checkpoint
+
+    # Anchors aus Checkpoint übernehmen
     basic_ranges = torch.linspace(-1, 1, args.anchor_num + 1).cuda()
     basic_anchors = (basic_ranges[1:] + basic_ranges[:-1]) / 2
     anchors = {'gamma': basic_anchors, 'beta': basic_anchors}
-    anchors['gamma'] = check_point['gamma']
-    anchors['beta'] = check_point['beta']
-    logging.info('Using saved anchors')
-    print('-> loaded checkpoint %s ' % (args.checkpoint_path))
+    if 'gamma' in check_point and len(check_point['gamma']) == args.anchor_num:
+        anchors['gamma'] = check_point['gamma']
+        anchors['beta'] = check_point['beta']
+        logging.info('Using saved anchors from checkpoint')
+    logging.info(f'-> loaded checkpoint {args.checkpoint_path}')
 
-    # network eval mode
     anchornet.eval()
     localnet.eval()
-    # stop rot and zoom for validation
     test_dataset.eval()
+
+    # Visualisierungs-Frames
+    vis_id = []
+    if args.vis_frame_ids:
+        vis_id = [int(x) for x in args.vis_frame_ids.split(',') if x.strip()]
 
     time_2d, time_data, time_6d, time_colli, time_nms = 0, 0, 0, 0, 0
 
+    # Sammelt alle Predictions für Evaluation
+    all_predictions = []   # list of (idx, grasppath, GraspNetGraspGroup)
+
     batch_idx = -1
-    vis_id = []
     with torch.no_grad():
         for anchor_data, rgb, ori_depth, grasppaths in test_data:
             batch_idx += 1
 
-            # medfilt first
+            # Depth verarbeiten (medfilt optional, hier deaktiviert)
             depth = ori_depth.numpy().squeeze()
-            # depth = medfilt2d(depth, kernel_size=5)
             depth = torch.from_numpy(depth).float()[None]
-            # get scene points
+
+            # Punktwolke aus Depth
             view_points, _, _ = test_data.dataset.helper.to_scene_points(
                 rgb.cuda(), depth.cuda(), include_rgb=True)
             points = view_points[..., :3]
             view_points = view_points.squeeze()
-            # get xyz maps
             xyzs = test_data.dataset.helper.to_xyz_maps(depth.cuda())
-            # get labels
+
+            # GT-Labels (nur für Eval später)
             all_grasp_labels = []
             for grasppath in grasppaths:
                 all_grasp_labels.append(np.load(grasppath))
 
-            # get time
+            # ---------------- 2D-Vorhersage ----------------
             start = time()
-
-            # 2d prediction
             x, _, _, _, _ = anchor_data
             x = x.cuda(non_blocking=True)
             pred_2d, perpoint_features = anchornet(x)
@@ -166,7 +247,6 @@ def inference():
             loc_map, cls_mask, theta_offset, height_offset, width_offset = \
                 anchor_output_process(*pred_2d, sigma=args.sigma)
 
-            # detect 2d grasp (x, y, theta)
             rect_gg = detect_2d_grasp(loc_map,
                                       cls_mask,
                                       theta_offset,
@@ -182,26 +262,33 @@ def inference():
                                       grasp_nms=args.grid_size,
                                       reduce='max')
 
-            # get 2d time
             if batch_idx >= 1:
                 torch.cuda.synchronize()
                 time_2d += time() - start
 
-            # 2d bbox validation
+            # 2D-Bbox-Validierung (für Eval)
             idx = anchor_data[2].numpy().squeeze()
             grasp_label = test_data.dataset.load_grasp_labels(idx)
             gt_rect_gg = RectGraspGroup()
             gt_rect_gg.load_from_dict(grasp_label)
 
-            # check 2d result
             if rect_gg.size == 0:
-                print('No 2d grasp found')
+                print(f'[{batch_idx}] No 2d grasp found, skipping')
+                # Trotzdem leeres Ergebnis dumpen, damit alle Frames vorkommen
+                gg_empty = GraspNetGraspGroup()
+                _save_predictions(args, batch_idx, SCENE_LIST, gg_empty)
+                all_predictions.append({
+                    'batch_idx': batch_idx,
+                    'idx': int(idx),
+                    'grasppath': grasppaths[0],
+                    'rect_gg': rect_gg,
+                    'gt_rect_gg': gt_rect_gg,
+                    'pred_grasp': None,
+                })
                 continue
 
-            # data time
+            # ---------------- Feature-Fusion + PC-Crop ----------------
             start = time()
-
-            # feature fusion
             points_all = feature_fusion(points, perpoint_features, xyzs)
             rect_ggs = [rect_gg]
             pc_group, valid_local_centers = data_process(
@@ -213,10 +300,8 @@ def inference():
                 min_points=32,
                 is_training=False)
             rect_gg = rect_ggs[0]
-            # batch_size == 1 when valid
             points_all = points_all.squeeze()
 
-            # get 2d grasp info (not grasp itself) for trainning
             grasp_info = np.zeros((0, 3), dtype=np.float32)
             g_thetas = rect_gg.thetas[None]
             g_ws = rect_gg.widths[None]
@@ -226,16 +311,14 @@ def inference():
             grasp_info = torch.from_numpy(grasp_info).to(dtype=torch.float32,
                                                          device='cuda')
 
-            # get data time
             if batch_idx >= 1:
                 torch.cuda.synchronize()
                 time_data += time() - start
-            start = time()
 
-            # get gamma and beta classification result
+            # ---------------- 6D-Vorhersage ----------------
+            start = time()
             _, pred, offset = localnet(pc_group, grasp_info)
 
-            # detect 6d grasp from 2d output and 6d output
             pred_grasp, pred_rect_gg = detect_6d_grasp_multi(
                 rect_gg,
                 pred,
@@ -244,32 +327,26 @@ def inference():
                 anchors,
                 k=args.local_k)
 
-            # get 6d time
             if batch_idx >= 1:
                 torch.cuda.synchronize()
                 time_6d += time() - start
 
-            # get collision detect time
+            # ---------------- Kollisionserkennung ----------------
             start = time()
-
-            # collision detect
             pred_grasp_from_rect = pred_rect_gg.to_6d_grasp_group(depth=0.02)
             pred_gg, valid_mask = collision_detect(points_all,
                                                    pred_grasp_from_rect,
                                                    mode='graspnet')
-            # pred_grasp = pred_grasp[valid_mask]
-
-            # get collision detect
             if batch_idx >= 1:
                 torch.cuda.synchronize()
                 time_colli += time() - start
-            start = time()
 
-            # Dump results for evaluation
+            # ---------------- NMS + Sortierung ----------------
+            start = time()
             gg = GraspNetGraspGroup()
             for pred_g in pred_gg:
                 g = GraspNetGrasp(pred_g.score, pred_g.width, pred_g.height,
-                                  pred_g.depth, pred_g.rotation.reshape(9, ),
+                                  pred_g.depth, pred_g.rotation.reshape(9,),
                                   pred_g.translation, -1)
                 gg.add(g)
             gg = gg.nms(0.03, 30 / 180 * np.pi)
@@ -279,120 +356,259 @@ def inference():
                 torch.cuda.synchronize()
                 time_nms += time() - start
 
-            pred_gg = HGGDGraspGroup(translations=gg.translations,
-                                     rotations=gg.rotation_matrices,
-                                     heights=gg.heights,
-                                     widths=gg.widths,
-                                     depths=gg.depths,
-                                     scores=gg.scores,
-                                     object_ids=gg.object_ids)
-
+            # Optional: Open3D-Visualisierung für ausgewählte Frames
             if batch_idx in vis_id:
-                print('pred gg ==', len(pred_gg))
-                grasp_geo = pred_gg.to_open3d_geometry_list()
+                pred_gg_viz = HGGDGraspGroup(translations=gg.translations,
+                                              rotations=gg.rotation_matrices,
+                                              heights=gg.heights,
+                                              widths=gg.widths,
+                                              depths=gg.depths,
+                                              scores=gg.scores,
+                                              object_ids=gg.object_ids)
+                print(f'[{batch_idx}] viz: {len(pred_gg_viz)} grasps')
+                grasp_geo = pred_gg_viz.to_open3d_geometry_list()
                 cloud = view_points[:, :3].cpu().numpy()
-                rgb = view_points[:, 3:6].cpu().numpy()
+                rgb_np = view_points[:, 3:6].cpu().numpy()
                 vispc = o3d.geometry.PointCloud()
                 vispc.points = o3d.utility.Vector3dVector(cloud)
-                vispc.colors = o3d.utility.Vector3dVector(rgb)
+                vispc.colors = o3d.utility.Vector3dVector(rgb_np)
                 o3d.visualization.draw_geometries([vispc] + grasp_geo)
 
-            log_str = f'{batch_idx // 256}:{batch_idx % 256}  pred 2d num: {rect_gg.size}'
-            log_str += f'\npred 6d num: {len(pred_grasp)}  no-colli: {valid_mask.sum()}  nms: {len(gg)}'
+            log_str = (f'[{batch_idx:4d}] {SCENE_LIST[batch_idx]} '
+                       f'pred-2d: {rect_gg.size}  pred-6d: {len(pred_grasp)}  '
+                       f'no-colli: {valid_mask.sum()}  nms: {len(gg)}')
             print(log_str)
 
-            # save grasps
-            save_dir = os.path.join(args.dump_dir, SCENE_LIST[batch_idx])
-            save_dir = os.path.join(save_dir, camera)
-            save_path = os.path.join(save_dir,
-                                     str(batch_idx % 256).zfill(4) + '.npy')
-            if not os.path.exists(save_dir):
-                os.makedirs(save_dir)
-            gg.save_npy(save_path)
+            # Predictions auf Festplatte dumpen
+            _save_predictions(args, batch_idx, SCENE_LIST, gg)
 
-    # time stat
-    batch_idx -= 1
-    time_2d = time_2d / batch_idx * 1000
-    time_data = time_data / batch_idx * 1000
-    time_6d = time_6d / batch_idx * 1000
-    time_colli = time_colli / batch_idx * 1000
-    time_nms = time_nms / batch_idx * 1000
-    logging.info('Time stats:')
-    logging.info(
-        f'Total: {time_2d + time_data + time_6d + time_colli + time_nms:.3f} ms'
-    )
-    logging.info(
-        f'2d: {time_2d:.3f} ms  data: {time_data:.3f} ms  6d: {time_6d:.3f} ms  colli: {time_colli:.3f} ms  nms: {time_nms:.3f} ms'
-    )
+            # Für Eval merken
+            pred_grasp_tensor = torch.from_numpy(pred_grasp).to(
+                device='cuda', dtype=torch.float32)
+            all_predictions.append({
+                'batch_idx': batch_idx,
+                'idx': int(idx),
+                'grasppath': grasppaths[0],
+                'rect_gg': rect_gg,
+                'gt_rect_gg': gt_rect_gg,
+                'pred_grasp': pred_grasp_tensor,
+            })
 
+    # Time-Statistik
+    if batch_idx > 1:
+        denom = batch_idx - 1
+        time_2d_ms = time_2d / denom * 1000
+        time_data_ms = time_data / denom * 1000
+        time_6d_ms = time_6d / denom * 1000
+        time_colli_ms = time_colli / denom * 1000
+        time_nms_ms = time_nms / denom * 1000
+        total_ms = time_2d_ms + time_data_ms + time_6d_ms + time_colli_ms + time_nms_ms
+        logging.info('Time stats (per frame, averaged):')
+        logging.info(f'  Total: {total_ms:.2f} ms')
+        logging.info(f'  2D:     {time_2d_ms:.2f} ms')
+        logging.info(f'  Data:   {time_data_ms:.2f} ms')
+        logging.info(f'  6D:     {time_6d_ms:.2f} ms')
+        logging.info(f'  Colli:  {time_colli_ms:.2f} ms')
+        logging.info(f'  NMS:    {time_nms_ms:.2f} ms')
 
-def evaluate():
-    # res = np.load('temp_result.npy')
-    ge = GraspNetEval(root=args.scene_path,
-                      camera=camera,
-                      split=(args.scene_l, args.scene_r))
-    res, ap, colli = ge.eval_scene_lr(args.dump_dir,
-                                      args.scene_l,
-                                      args.scene_r,
-                                      proc=args.num_workers)
-    np.save('temp_result.npy', res)
-    # get ap 0.8 and ap 0.4
-    aps = res.mean(0).mean(0).mean(0)
-    logging.info(f'Scene: {args.scene_l} ~ {args.scene_r}')
-    logging.info(f'colli == {colli}')
-    logging.info(f'ap == {ap}')
-    logging.info(f'ap0.8 == {aps[3]}')
-    logging.info(f'ap0.4 == {aps[1]}')
+    return all_predictions, test_dataset
 
 
-if __name__ == '__main__':
-    # multiprocess
-    # mp.set_start_method('spawn')
-    # set torch and gpu setting
+def _save_predictions(args, batch_idx, scene_list, gg):
+    """Speichert die Predictions als NPY-Datei pro Frame."""
+    save_dir = os.path.join(args.dump_dir, scene_list[batch_idx], camera)
+    if not os.path.exists(save_dir):
+        os.makedirs(save_dir)
+    frame_idx = batch_idx % args.frames_per_scene
+    save_path = os.path.join(save_dir, f'{frame_idx:04d}.npy')
+    gg.save_npy(save_path)
+
+
+# =============================================================================
+# Eigene Evaluation: NPZ-Labels vs. Predictions
+# =============================================================================
+def evaluate(all_predictions, dataset):
+    """
+    Vergleicht alle Predictions mit GT-Labels aus den NPZ-Files.
+    Gibt aggregierte Metriken aus (analog zu validate() in train_graspnet.py).
+
+    Args:
+        all_predictions: List der Predictions von inference()
+        dataset: Das Test-Dataset-Objekt (für get_gtbb())
+    """
+    if not all_predictions:
+        logging.warning('No predictions to evaluate.')
+        return
+
+    results = {
+        'iou_correct': 0,
+        'iou_total': 0,
+        'cover_cnt': 0,
+        'label_cnt': 0,
+    }
+    for scale_factor in eval_scale:
+        thre_dis = dis_criterion * scale_factor
+        thre_rot = rot_criterion * scale_factor
+        results[f'grasp_{scale_factor}'] = np.zeros((2,))
+        results[f'trans_{thre_dis}'] = np.zeros((2,))
+        results[f'rot_{thre_rot}'] = np.zeros((2,))
+
+    n_skipped = 0
+
+    for entry in all_predictions:
+        if entry['pred_grasp'] is None:
+            n_skipped += 1
+            continue
+
+        rect_gg = entry['rect_gg']
+        gt_rect_gg = entry['gt_rect_gg']
+        pred_grasp = entry['pred_grasp']
+        grasppath = entry['grasppath']
+
+        # 2D-IoU-Match (rotation/zoom = 0/1 für Eval-Modus)
+        rot = 0.0
+        zoom_factor = 1.0
+        try:
+            # GT-Bboxen über die Dataset-Methode holen (macht Skalierung korrekt)
+            gt_bbs = dataset.get_gtbb(gt_rect_gg, rot, zoom_factor)
+            s = calculate_iou_match(rect_gg[0:1], gt_bbs, thre=0.25)
+            if s:
+                results['iou_correct'] += 1
+            results['iou_total'] += 1
+        except Exception as e:
+            logging.warning(f'IoU calc failed for batch {entry["batch_idx"]}: {e}')
+
+        # 6D-Match gegen Original-Labels
+        try:
+            gg_ori_labels = get_ori_grasp_label([grasppath])
+            for scale_factor in eval_scale:
+                thre_dis = dis_criterion * scale_factor
+                thre_rot = rot_criterion * scale_factor
+                r_g, r_d, r_r = calculate_6d_match(pred_grasp,
+                                                   gg_ori_labels,
+                                                   threshold_dis=thre_dis,
+                                                   threshold_rot=thre_rot)
+                results[f'grasp_{scale_factor}'] += r_g
+                results[f'trans_{thre_dis}'] += r_d
+                results[f'rot_{thre_rot}'] += r_r
+
+            cover_cnt = calculate_coverage(pred_grasp, gg_ori_labels)
+            results['cover_cnt'] += cover_cnt
+            results['label_cnt'] += len(gg_ori_labels)
+        except Exception as e:
+            logging.warning(f'6D match failed for batch {entry["batch_idx"]}: {e}')
+
+    # Ergebnisse loggen
+    logging.info('=' * 60)
+    logging.info('TEST EVALUATION RESULTS')
+    logging.info('=' * 60)
+    logging.info(f'Total frames evaluated: {len(all_predictions)} '
+                 f'(skipped: {n_skipped})')
+
+    if results['iou_total'] > 0:
+        iou_rate = results['iou_correct'] / results['iou_total']
+        logging.info(f'2D IoU@0.25: {results["iou_correct"]}/{results["iou_total"]} '
+                     f'= {iou_rate:.4f}')
+
+    logging.info('-' * 60)
+    logging.info('6D Grasp Matches (different scale thresholds):')
+    logging.info('NOTE: trans/rot/grasp are bidirectional matches (pred->gt and gt->pred).')
+    logging.info('Format: matched / candidates = rate  (across all evaluated frames)')
+    for scale_factor in eval_scale:
+        thre_dis = dis_criterion * scale_factor
+        thre_rot = rot_criterion * scale_factor
+        g_arr = results[f'grasp_{scale_factor}']
+        d_arr = results[f'trans_{thre_dis}']
+        r_arr = results[f'rot_{thre_rot}']
+        g_match, g_total = int(g_arr[0]), int(g_arr[1])
+        d_match, d_total = int(d_arr[0]), int(d_arr[1])
+        r_match, r_total = int(r_arr[0]), int(r_arr[1])
+        g_rate = g_match / max(g_total, 1)
+        d_rate = d_match / max(d_total, 1)
+        r_rate = r_match / max(r_total, 1)
+        logging.info(
+            f'  scale={scale_factor:.2f}  '
+            f'trans_{thre_dis:.2f}: {d_match}/{d_total} = {d_rate:.3f}  '
+            f'rot_{thre_rot:.2f}: {r_match}/{r_total} = {r_rate:.3f}  '
+            f'grasp_{scale_factor:.2f}: {g_match}/{g_total} = {g_rate:.3f}'
+        )
+
+    logging.info('-' * 60)
+    if results['label_cnt'] > 0:
+        cov_rate = results['cover_cnt'] / results['label_cnt']
+        logging.info(f'Coverage: {results["cover_cnt"]} / {results["label_cnt"]} '
+                     f'= {cov_rate:.4f}')
+    logging.info('=' * 60)
+
+
+def _make_gt_bbs(gt_rect_gg):
+    """[deprecated, kept for compatibility] Use dataset.get_gtbb() instead."""
+    return gt_rect_gg
+
+
+# =============================================================================
+# Main
+# =============================================================================
+def main():
     np.set_printoptions(precision=4, suppress=True)
     torch.set_printoptions(precision=4, sci_mode=False)
-    if torch.cuda.is_available():
-        torch.backends.cudnn.enabled = True
-        torch.backends.cudnn.benchmark = False
-    else:
+    if not torch.cuda.is_available():
         raise RuntimeError('CUDA not available')
+    torch.backends.cudnn.enabled = True
+    torch.backends.cudnn.benchmark = False
 
-    # random seed
     random.seed(args.random_seed)
     np.random.seed(args.random_seed)
     torch.manual_seed(args.random_seed)
 
-    # Set-up output directories
+    # Output-Verzeichnis vorbereiten
     net_desc = datetime.datetime.now().strftime('%y%m%d_%H%M%S')
-    net_desc = net_desc + '_' + args.description
-    net_desc = 'graspnet_test' + net_desc
+    net_desc = f'graspnet_test_{net_desc}_{args.description}'
 
     save_folder = os.path.join(args.logdir, net_desc)
-    if not os.path.exists(save_folder):
-        os.makedirs(save_folder)
+    os.makedirs(save_folder, exist_ok=True)
 
-    # Save commandline args
-    if args is not None:
-        params_path = os.path.join(save_folder, 'commandline_args.json')
-        with open(params_path, 'w') as f:
-            json.dump(vars(args), f)
+    params_path = os.path.join(save_folder, 'commandline_args.json')
+    with open(params_path, 'w') as f:
+        json.dump(vars(args), f, indent=2)
 
-    # Initialize logging
+    # Logging
     logging.root.handlers = []
     logging.basicConfig(
         level=logging.INFO,
-        filename='{0}/{1}.log'.format(save_folder, 'log'),
-        format=
-        '[%(asctime)s] {%(pathname)s:%(lineno)d} %(levelname)s - %(message)s',
-        datefmt='%H:%M:%S')
-    # set up logging to console
+        filename=os.path.join(save_folder, 'log.log'),
+        format='[%(asctime)s] {%(pathname)s:%(lineno)d} %(levelname)s - %(message)s',
+        datefmt='%H:%M:%S',
+    )
     console = logging.StreamHandler()
-    console.setLevel(logging.DEBUG)
-    # set a format which is simpler for console use
-    formatter = logging.Formatter('%(name)-12s: %(levelname)-8s %(message)s')
-    console.setFormatter(formatter)
-    # add the handler to the root logger
+    console.setLevel(logging.INFO)
+    console.setFormatter(logging.Formatter('%(name)-12s: %(levelname)-8s %(message)s'))
     logging.getLogger('').addHandler(console)
 
-    inference()
-    evaluate()
+    logging.info('=' * 60)
+    logging.info('VIRAS HGGD Test')
+    logging.info('=' * 60)
+    logging.info(f'Checkpoint:    {args.checkpoint_path}')
+    logging.info(f'Dataset path:  {args.dataset_path}')
+    logging.info(f'Scene path:    {args.scene_path}')
+    logging.info(f'Frames/scene:  {args.frames_per_scene}')
+    logging.info(f'Dump dir:      {args.dump_dir}')
+
+    # Test-Szenen laden
+    sceneIds = load_test_scenes(args.scene_path)
+    if not sceneIds:
+        logging.error('No test scenes found, aborting.')
+        return
+
+    # Inferenz
+    all_predictions, test_dataset = inference(sceneIds)
+
+    # Evaluation (wenn gewünscht)
+    if not args.skip_eval:
+        evaluate(all_predictions, test_dataset)
+    else:
+        logging.info('Evaluation skipped (--skip-eval).')
+
+
+if __name__ == '__main__':
+    main()

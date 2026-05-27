@@ -40,7 +40,8 @@ class GraspnetAnchorDataset(GraspDataset):
                  include_rgb=True,
                  include_depth=True,
                  noise=0,
-                 aug=False):
+                 aug=False,
+                 frames_per_scene=256):
         logging.info('Using Graspnet dataset')
         # basic attributes
         self.trainning = True
@@ -60,6 +61,7 @@ class GraspnetAnchorDataset(GraspDataset):
         self.grasp_count = grasp_count
         # gaussian kernel size
         self.sigma = sigma
+        self.frames_per_scene = frames_per_scene
 
         self.colorpath = []
         self.depthpath = []
@@ -89,7 +91,7 @@ class GraspnetAnchorDataset(GraspDataset):
             self.alignmatpath.append(
                 os.path.join(graspnetroot, 'scenes', x, camera,
                              'cam0_wrt_table.npy'))
-            for img_num in range(256):
+            for img_num in range(self.frames_per_scene):
                 self.colorpath.append(
                     os.path.join(graspnetroot, 'scenes', x, camera, 'rgb',
                                  str(img_num).zfill(4) + '.png'))
@@ -104,7 +106,7 @@ class GraspnetAnchorDataset(GraspDataset):
 
         for x in tqdm(self.sceneIds_str,
                       desc='Loading 6d grasp label path...'):
-            for ann_num in range(256):
+            for ann_num in range(self.frames_per_scene):
                 self.grasppath.append(
                     os.path.join(labelroot, '6d_dataset', x, 'grasp_labels',
                                  '{}_view.npz'.format(ann_num)))
@@ -119,9 +121,10 @@ class GraspnetPointDataset(GraspnetAnchorDataset):
         self.helper = PointCloudHelper(self.all_points_num)
 
     def get_camera_pose(self, index):
-        camera_pose = np.load(self.cameraposepath[index // 256])
-        align_mat = np.load(self.alignmatpath[index // 256])
-        return align_mat @ camera_pose[index % 256]
+        n = self.frames_per_scene
+        camera_pose = np.load(self.cameraposepath[index // n])
+        align_mat = np.load(self.alignmatpath[index // n])
+        return align_mat @ camera_pose[index % n]
 
     def __getitem__(self, index):
         # get anchor data

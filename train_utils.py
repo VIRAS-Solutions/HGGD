@@ -217,6 +217,9 @@ def parse_args():
                         type=int,
                         default=123,
                         help='Random seed')
+    
+    parser.add_argument('--frames-per-scene', type=int, default=256,
+                    help='Number of frames per scene (GraspNet default: 256)')
 
     args = parser.parse_args()
     if args.joint_trainning:

@@ -11,6 +11,7 @@ from matplotlib import pyplot as plt
 from PIL import Image
 from torchsummary import summary
 from tqdm import tqdm
+import json
 
 from dataset.evaluation import (anchor_output_process, calculate_6d_match,
                                 calculate_coverage, calculate_iou_match,
@@ -542,7 +543,21 @@ def run():
 
     # Load Dataset
     logging.info('Loading Dataset...')
-    sceneIds = list(range(args.scene_l, args.scene_r))
+    splits_file = os.path.join(args.scene_path, 'splits.json')
+    if os.path.exists(splits_file):
+        with open(splits_file) as f:
+            splits = json.load(f)
+        sceneIds = sorted(splits['train'])
+        val_list = sorted(splits['val'])
+        logging.info(f'Using splits.json: train={len(sceneIds)} '
+                     f'val={len(val_list)} test={len(splits.get("test", []))}')
+    else:
+        # Fallback: legacy GraspNet-style range
+        sceneIds = list(range(args.scene_l, args.scene_r))
+        val_list = list(range(64, 65))
+        logging.info(f'No splits.json, using ranges: '
+                     f'train={sceneIds[:5]}... val={val_list}')
+        
     Dataset = GraspnetPointDataset(args.all_points_num,
                                    args.dataset_path,
                                    args.scene_path,
@@ -556,23 +571,26 @@ def run():
                                    grasp_count=args.grasp_count,
                                    output_size=(args.input_w, args.input_h),
                                    random_rotate=False,
-                                   random_zoom=False)
-    val_list = list(range(100, 101))
+                                   random_zoom=False,
+                                   frames_per_scene = args.frames_per_scene)
+    
+
     Val_Dataset = GraspnetPointDataset(args.all_points_num,
-                                       args.dataset_path,
-                                       args.scene_path,
-                                       val_list,
-                                       noise=args.noise,
-                                       sigma=args.sigma,
-                                       ratio=args.ratio,
-                                       anchor_k=args.anchor_k,
-                                       anchor_z=args.anchor_z,
-                                       anchor_w=args.anchor_w,
-                                       grasp_count=args.grasp_count,
-                                       output_size=(args.input_w,
-                                                    args.input_h),
-                                       random_rotate=False,
-                                       random_zoom=False)
+                                        args.dataset_path,
+                                        args.scene_path,
+                                        val_list,
+                                        noise=args.noise,
+                                        sigma=args.sigma,
+                                        ratio=args.ratio,
+                                        anchor_k=args.anchor_k,
+                                        anchor_z=args.anchor_z,
+                                        anchor_w=args.anchor_w,
+                                        grasp_count=args.grasp_count,
+                                        output_size=(args.input_w,
+                                                        args.input_h),
+                                        random_rotate=False,
+                                        random_zoom=False,
+                                        frames_per_scene = args.frames_per_scene)
 
     logging.info('Training size: {}'.format(len(Dataset)))
     logging.info('Validation size: {}'.format(len(Val_Dataset)))
