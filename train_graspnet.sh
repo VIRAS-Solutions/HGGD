@@ -38,8 +38,8 @@ CUDA_VISIBLE_DEVICES=0 python train_graspnet.py \
   --loc-a 1 --reg-b 5 --cls-c 1 --offset-d 1 \
   --epochs 15 --ratio 8 --num-workers 4 \
   --save-freq 1 --optim adamw \
-  --dataset-path '/data/hggd_dataset/grasp_label' \
-  --scene-path   '/data/hggd_dataset' \
+  --dataset-path '/data/hggd_dataset_v2/grasp_label' \
+  --scene-path   '/data/hggd_dataset_v2' \
   --joint-trainning \
   --description 'proberoehrchen_v2' \
   --frames-per-scene 50 

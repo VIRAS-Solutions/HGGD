@@ -13,8 +13,8 @@ def set_current_camera_intrinsics(intrinsics):
 
 def get_camera_intrinsic(camera=camera):
     # Set dynammically camera instrinsics from ImageRGBD ROS Topic
-    if current_camera_intrinsics is not None:
-        return current_camera_intrinsics
+    #if current_camera_intrinsics is not None:
+    #    return current_camera_intrinsics
     
     #logging.warning("Using fallback camera intrinsics - no dynamic values available!")
     #Fallback to hardcoded instrinsics
