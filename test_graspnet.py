@@ -114,14 +114,21 @@ parser.add_argument('--logdir', type=str, default='./logs/')
 parser.add_argument('--random-seed', type=int, default=123)
 parser.add_argument('--description', type=str, default='')
 
+
+# Translations-/Rotationsschwellen für calculate_6d_match (Eval)
+parser.add_argument('--dis-criterion', type=float, default=0.05,
+                    help='Translationsschwelle [m] fuer calculate_6d_match')
+parser.add_argument('--rot-criterion', type=float, default=0.25,
+                    help='Rotationsschwelle [rad] fuer calculate_6d_match')
+
 args = parser.parse_args()
 
 
 # =============================================================================
 # Konstanten für Eval (gleich wie in train_graspnet.py)
 # =============================================================================
-dis_criterion = 0.05
-rot_criterion = 0.25
+dis_criterion = args.dis_criterion
+rot_criterion = args.rot_criterion
 eval_scale = [0.2, 0.4, 0.6, 0.8, 1.0]
 
 
@@ -539,11 +546,39 @@ def evaluate(all_predictions, dataset):
         logging.info(f'Coverage: {results["cover_cnt"]} / {results["label_cnt"]} '
                      f'= {cov_rate:.4f}')
     logging.info('=' * 60)
+    return results
 
 
 def _make_gt_bbs(gt_rect_gg):
     """[deprecated, kept for compatibility] Use dataset.get_gtbb() instead."""
     return gt_rect_gg
+
+def _metrics_to_json(results):
+    """results enthaelt gemischte Typen: numpy-Paare (matched, total),
+    Python-Ints und Torch-Tensoren von calculate_coverage."""
+    def as_array(value):
+        if hasattr(value, 'detach'):            # torch.Tensor, ggf. auf der GPU
+            value = value.detach().cpu().numpy()
+        return np.asarray(value, dtype=np.float64)
+
+    out = {}
+    for key, value in results.items():
+        arr = as_array(value)
+        if arr.size == 2:
+            out[key] = {'matched': float(arr[0]),
+                        'total': float(arr[1]),
+                        'rate': float(arr[0] / max(arr[1], 1.0))}
+        else:
+            out[key] = float(arr.reshape(-1)[0])
+
+    out['thresholds'] = {'dis_criterion': dis_criterion,
+                         'rot_criterion': rot_criterion,
+                         'eval_scale': list(eval_scale)}
+    out['rates'] = {
+        'iou': out['iou_correct'] / max(out['iou_total'], 1.0),
+        'coverage': out['cover_cnt'] / max(out['label_cnt'], 1.0),
+    }
+    return out
 
 
 # =============================================================================
@@ -605,7 +640,12 @@ def main():
 
     # Evaluation (wenn gewünscht)
     if not args.skip_eval:
-        evaluate(all_predictions, test_dataset)
+        results = evaluate(all_predictions, test_dataset)
+        if results is not None:
+            metrics_path = os.path.join(save_folder, 'metrics.json')
+            with open(metrics_path, 'w') as f:
+                json.dump(_metrics_to_json(results), f, indent=2)
+            logging.info(f'metrics.json geschrieben: {metrics_path}')
     else:
         logging.info('Evaluation skipped (--skip-eval).')
 
