@@ -623,7 +623,7 @@ def run():
             anchors['beta'] = ckpt['beta']
             logging.info('Using saved anchors')
         anchornet.load_state_dict(ckpt['anchor'])
-        # localnet.load_state_dict(ckpt['local'])
+        localnet.load_state_dict(ckpt['local'])
 
     # set optimizer
     params = itertools.chain(anchornet.parameters(), localnet.parameters())
