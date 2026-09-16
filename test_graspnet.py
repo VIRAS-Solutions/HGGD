@@ -121,6 +121,16 @@ parser.add_argument('--dis-criterion', type=float, default=0.05,
 parser.add_argument('--rot-criterion', type=float, default=0.25,
                     help='Rotationsschwelle [rad] fuer calculate_6d_match')
 
+# Optional: eigene Schwellen für IoU/Coverage
+parser.add_argument('--iou-thre', type=float, default=0.25,
+                    help='IoU-Schwelle fuer calculate_iou_match')
+parser.add_argument('--iou-topk', type=int, default=1,
+                    help='Wie viele 2D-Vorschlaege geprueft werden (HGGD: nur Top-1)')
+parser.add_argument('--coverage-dis', type=float, default=0.02,
+                    help='Translationsschwelle [m] fuer calculate_coverage')
+parser.add_argument('--coverage-rot', type=float, default=0.1,
+                    help='Rotationsschwelle [rad] fuer calculate_coverage')
+
 args = parser.parse_args()
 
 
@@ -130,6 +140,28 @@ args = parser.parse_args()
 dis_criterion = args.dis_criterion
 rot_criterion = args.rot_criterion
 eval_scale = [0.2, 0.4, 0.6, 0.8, 1.0]
+
+
+# Werte, die fest in dataset/evaluation.py bzw. dataset/grasp.py stehen.
+# Nicht konfigurierbar -- aber sie gehoeren in die Metadaten, sonst ist in
+# sechs Monaten nicht mehr nachvollziehbar, unter welchen Bedingungen
+# gemessen wurde.
+EVAL_CONSTANTS = {
+    'collision_voxel_size': 0.01,       # ModelFreeCollisionDetector
+    'collision_approach_dist': 0.05,    # mfcdetector.detect
+    'collision_mode': 'graspnet',
+    'grasp_depth': 0.02,                # to_6d_grasp_group(depth=...)
+    'gamma_limit_rad': float(np.pi / 3),  # Filter in detect_6d_grasp_multi
+    'rot_uses_soft_distance': True,     # correct_rot prueft mit 2x threshold_dis
+    'measured_on': 'rohe 6D-Vorhersagen vor collision_detect und NMS',
+}
+
+# ============================================================================
+# Hilfsfunktionen
+# ============================================================================
+def thre_key(prefix, value):
+    """Stabiler Schluessel fuer eine Schwelle: 0.010000000000000002 -> 'trans_0.01'."""
+    return f'{prefix}_{round(float(value), 6):g}'
 
 
 # =============================================================================
@@ -457,8 +489,8 @@ def evaluate(all_predictions, dataset):
         thre_dis = dis_criterion * scale_factor
         thre_rot = rot_criterion * scale_factor
         results[f'grasp_{scale_factor}'] = np.zeros((2,))
-        results[f'trans_{thre_dis}'] = np.zeros((2,))
-        results[f'rot_{thre_rot}'] = np.zeros((2,))
+        results[thre_key('trans', thre_dis)] = np.zeros((2,))
+        results[thre_key('rot', thre_rot)] = np.zeros((2,))
 
     n_skipped = 0
 
@@ -478,7 +510,7 @@ def evaluate(all_predictions, dataset):
         try:
             # GT-Bboxen über die Dataset-Methode holen (macht Skalierung korrekt)
             gt_bbs = dataset.get_gtbb(gt_rect_gg, rot, zoom_factor)
-            s = calculate_iou_match(rect_gg[0:1], gt_bbs, thre=0.25)
+            s = calculate_iou_match(rect_gg[0:args.iou_topk], gt_bbs, thre=args.iou_thre)
             if s:
                 results['iou_correct'] += 1
             results['iou_total'] += 1
@@ -496,10 +528,12 @@ def evaluate(all_predictions, dataset):
                                                    threshold_dis=thre_dis,
                                                    threshold_rot=thre_rot)
                 results[f'grasp_{scale_factor}'] += r_g
-                results[f'trans_{thre_dis}'] += r_d
-                results[f'rot_{thre_rot}'] += r_r
+                results[thre_key('trans', thre_dis)] += r_d
+                results[thre_key('rot', thre_rot)] += r_r
 
-            cover_cnt = calculate_coverage(pred_grasp, gg_ori_labels)
+            cover_cnt = calculate_coverage(pred_grasp, gg_ori_labels,
+                                           threshold_dis=args.coverage_dis,
+                                           threshold_rot=args.coverage_rot)
             results['cover_cnt'] += cover_cnt
             results['label_cnt'] += len(gg_ori_labels)
         except Exception as e:
@@ -520,25 +554,22 @@ def evaluate(all_predictions, dataset):
     logging.info('-' * 60)
     logging.info('6D Grasp Matches (different scale thresholds):')
     logging.info('NOTE: trans/rot/grasp are bidirectional matches (pred->gt and gt->pred).')
-    logging.info('Format: matched / candidates = rate  (across all evaluated frames)')
+    logging.info('Format: right / all candidates = rate')
     for scale_factor in eval_scale:
         thre_dis = dis_criterion * scale_factor
         thre_rot = rot_criterion * scale_factor
         g_arr = results[f'grasp_{scale_factor}']
-        d_arr = results[f'trans_{thre_dis}']
-        r_arr = results[f'rot_{thre_rot}']
-        g_match, g_total = int(g_arr[0]), int(g_arr[1])
-        d_match, d_total = int(d_arr[0]), int(d_arr[1])
-        r_match, r_total = int(r_arr[0]), int(r_arr[1])
-        g_rate = g_match / max(g_total, 1)
-        d_rate = d_match / max(d_total, 1)
-        r_rate = r_match / max(r_total, 1)
+        d_arr = results[thre_key('trans', thre_dis)]
+        r_arr = results[thre_key('rot', thre_rot)]
+        g_ok, g_bad = int(g_arr[0]), int(g_arr[1])
+        d_ok, d_bad = int(d_arr[0]), int(d_arr[1])
+        r_ok, r_bad = int(r_arr[0]), int(r_arr[1])
         logging.info(
             f'  scale={scale_factor:.2f}  '
-            f'trans_{thre_dis:.2f}: {d_match}/{d_total} = {d_rate:.3f}  '
-            f'rot_{thre_rot:.2f}: {r_match}/{r_total} = {r_rate:.3f}  '
-            f'grasp_{scale_factor:.2f}: {g_match}/{g_total} = {g_rate:.3f}'
-        )
+            f'trans_{thre_dis:.2f}: {d_ok}/{d_ok + d_bad} = {d_ok / max(d_ok + d_bad, 1):.3f}  '
+            f'rot_{thre_rot:.2f}: {r_ok}/{r_ok + r_bad} = {r_ok / max(r_ok + r_bad, 1):.3f}  '
+            f'grasp_{scale_factor:.2f}: {g_ok}/{g_ok + g_bad} = {g_ok / max(g_ok + g_bad, 1):.3f}')
+        
 
     logging.info('-' * 60)
     if results['label_cnt'] > 0:
@@ -554,22 +585,29 @@ def _make_gt_bbs(gt_rect_gg):
     return gt_rect_gg
 
 def _metrics_to_json(results):
-    """results enthaelt gemischte Typen: numpy-Paare (matched, total),
-    Python-Ints und Torch-Tensoren von calculate_coverage."""
+    """calculate_6d_match liefert [richtig, falsch] -- NICHT [matched, total].
+    Der Nenner ist die Summe beider, nicht das zweite Element."""
     def as_array(value):
-        if hasattr(value, 'detach'):            # torch.Tensor, ggf. auf der GPU
+        if hasattr(value, 'detach'):
             value = value.detach().cpu().numpy()
         return np.asarray(value, dtype=np.float64)
 
-    out = {}
+    out, seen_n = {}, {}
     for key, value in results.items():
         arr = as_array(value)
         if arr.size == 2:
-            out[key] = {'matched': float(arr[0]),
-                        'total': float(arr[1]),
-                        'rate': float(arr[0] / max(arr[1], 1.0))}
+            correct, false = float(arr[0]), float(arr[1])
+            n = correct + false
+            out[key] = {'correct': correct, 'false': false, 'n': n,
+                        'rate': correct / max(n, 1.0)}
+            seen_n[key] = n
         else:
             out[key] = float(arr.reshape(-1)[0])
+
+    # Selbsttest: alle Schwellenmetriken zaehlen dieselbe Grundmenge.
+    # Weichen sie ab, ist die Akkumulation kaputt -- lieber hier auffallen.
+    if len(set(seen_n.values())) > 1:
+        logging.warning(f'Grundmenge nicht einheitlich: {seen_n}')
 
     out['thresholds'] = {'dis_criterion': dis_criterion,
                          'rot_criterion': rot_criterion,
@@ -577,7 +615,9 @@ def _metrics_to_json(results):
     out['rates'] = {
         'iou': out['iou_correct'] / max(out['iou_total'], 1.0),
         'coverage': out['cover_cnt'] / max(out['label_cnt'], 1.0),
+        'grasp_full': out[f'grasp_{eval_scale[-1]}']['rate'],
     }
+    out['constants'] = dict(EVAL_CONSTANTS)
     return out
 
 
