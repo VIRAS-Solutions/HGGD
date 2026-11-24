@@ -228,7 +228,10 @@ def inference(sceneIds):
     localnet = PointMultiGraspNet(info_size=3, k_cls=args.anchor_num**2).cuda()
 
     # Checkpoint laden
-    check_point = torch.load(args.checkpoint_path, weights_only=False)
+    try:
+        check_point = torch.load(args.checkpoint_path, weights_only=False)
+    except TypeError:
+        check_point = torch.load(args.checkpoint_path)
     anchornet.load_state_dict(check_point['anchor'])
     localnet.load_state_dict(check_point['local'])
 
